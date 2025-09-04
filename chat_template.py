@@ -1,22 +1,19 @@
 #! /usr/bin/env python3
 
-import json as pyjson
-import guidance
+from contextlib import contextmanager
+from guidance import guidance
 from guidance import system, user, assistant, gen,  special_token, select
 from guidance import json as gjson
 from guidance.chat import ChatTemplate, UnsupportedRoleException
-from dataclasses import is_dataclass, asdict
-from pydantic import BaseModel
-import llama_cpp
 from guidance.models import LlamaCpp
-from typing import List, Literal
+from typing import Any, Annotated, Literal, Union, get_origin, get_args
 
 import inspect, json, typing
 from dataclasses import dataclass
 from typing import Any, get_origin
 
-from pydantic import BaseModel, create_model
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter, create_model, ConfigDict, Field
+from pydantic.types import StrictInt, StrictStr, StrictFloat, StrictBool
 
 QWEN3_TMPL = """{%- if tools %}
     {{- '<|im_start|>system\n' }}
@@ -220,39 +217,63 @@ class ToolSpec:
     fn: typing.Callable
 
 class Tools:
-    def __init__(self):
+    def __init__(self, *, strict_primitives: bool = False):
         self._by_name: dict[str, ToolSpec] = {}
+        self._strict_primitives = strict_primitives
 
-    def _model_from_fn(self, fn: typing.Callable) -> type[BaseModel]:
-        """Build a Pydantic model from function annotations (v2)."""
-        sig = inspect.signature(fn)
-        fields: dict[str, tuple[Any, Any]] = {}
-        for name, p in sig.parameters.items():
-            if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
-                continue  # keep it representable as JSON
-            annot = p.annotation if p.annotation is not inspect._empty else Any
-            default = p.default if p.default is not inspect._empty else ...
-            fields[name] = (annot, default)
-        return create_model(f"{fn.__name__}Params", **fields)  # type: ignore
+    def _strictify(self, annot: Any) -> Any:
+        """Optionally map primitives to Strict* types (no coercion)."""
+        if not self._strict_primitives:
+            return annot
 
-    def register(self, *functions: typing.Callable, description: str | None = None, name: str | None = None):
+        origin = get_origin(annot)
+        if origin is None:
+            return {
+                int: StrictInt,
+                str: StrictStr,
+                float: StrictFloat,
+                bool: StrictBool,
+            }.get(annot, annot)
+
+        # Recurse for common containers / unions
+        args = tuple(self._strictify(a) for a in get_args(annot))
+        if origin in (list, typing.List):
+            return list[args[0] if args else Any]
+        if origin in (set, typing.Set):
+            return set[args[0] if args else Any]
+        if origin in (tuple, typing.Tuple):
+            return tuple[args] if args else tuple[Any, ...]
+        if origin in (dict, typing.Dict):
+            k = args[0] if args else Any
+            v = args[1] if len(args) > 1 else Any
+            return dict[k, v]
+        if origin is Union:
+            return Union[args]  # handles Optional[T] too
+        return annot
+
+    class _ForbidExtra(BaseModel):
+        model_config = ConfigDict(extra='forbid')  # no unknown keys anywhere
+
+    def _register(self, *functions: typing.Callable, description: str | None = None, name: str | None = None):
         for fn in functions:
+            sig = inspect.signature(fn)
+            fields: dict[str, tuple[Any, Any]] = {}
+            for name, p in sig.parameters.items():
+                if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                    # **kwargs / *args are not representable in JSON
+                    continue
+                annot = p.annotation if p.annotation is not inspect._empty else Any
+                annot = self._strictify(annot)
+                default = p.default if p.default is not inspect._empty else ...
+                fields[name] = (annot, default)
+
             tool_name = name or fn.__name__
             desc = (description or fn.__doc__ or tool_name).strip()
-            Params = self._model_from_fn(fn)
+            Params = create_model(f"{fn.__name__}Params", __base__=self._ForbidExtra, **fields)
             self._by_name[tool_name] = ToolSpec(tool_name, desc, Params, fn)
 
-    # Decorator form
-    def tool(self, *dargs, **dkwargs):
-        def wrap(fn):
-            self.register(fn, **dkwargs)
-            return fn
-        if dargs and callable(dargs[0]) and not dkwargs:
-            return wrap(dargs[0])
-        return wrap
+    def system_preface(self) -> str:
 
-    # Qwen3-style <tools> block for the system prompt
-    def tools_block(self) -> str:
         defs = []
         for spec in self._by_name.values():
             defs.append({
@@ -263,49 +284,100 @@ class Tools:
                     "parameters": spec.Params.model_json_schema(),
                 },
             })
-        return "<tools>\n" + "\n".join(json.dumps(d, ensure_ascii=False) for d in defs) + "\n</tools>"
+        tools = "<tools>\n" + "\n".join(json.dumps(d, ensure_ascii=False) for d in defs) + "\n</tools>"
 
-    def system_preface(self) -> str:
         return (
             "# Tools\n\n"
             "You may call one or more functions to assist with the user query.\n\n"
             "You are provided with function signatures within <tools></tools> XML tags:\n"
-            f"{self.tools_block()}\n\n"
+            f"{tools}\n\n"
             "For each function call, return a JSON object with function name and arguments within <tool_call> tags:\n"
             "<tool_call>\n"
             "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
             "</tool_call>"
         )
 
-    def spec_for(self, fn_or_name: str | typing.Callable) -> ToolSpec:
-        return self._by_name[fn_or_name if isinstance(fn_or_name, str) else fn_or_name.__name__]
-
     def execute(self, name: str, arguments: dict) -> Any:
         """Validate with Pydantic, then call the Python function."""
+        if name not in self._by_name:
+            raise ValueError(f"Unknown tool: {name!r}")
         spec = self._by_name[name]
         args = spec.Params.model_validate(arguments).model_dump()
         return spec.fn(**args)
 
-@guidance(stateless=True)
-def thoughts(lm, var_name="thoughts"):
-    """Emit: <think>...</think> for a tool call."""
-    lm += special_token("<think>") + '\n'
-    lm += gen(name=var_name)
-    lm += special_token("</think>") + '\n\n'
-    return lm
+    # Decorator form
+    def tool(self, *dargs, **dkwargs):
+        def wrap(fn):
+            self._register(fn, **dkwargs)
+            return fn
+        if dargs and callable(dargs[0]) and not dkwargs:
+            return wrap(dargs[0])
+        return wrap
 
-class FnArgs(BaseModel):
-    """Model for function arguments."""
-    name: str
-    arguments: List[dict[str, Any]]
+    def _tool_call_union_type(self) -> Any:
+        """Build a discriminated union over name -> arguments schema."""
+        if not self._by_name:
+            raise ValueError("No tools registered")
 
-@guidance(stateless=True)
-def tool(lm, var_name="tool_args"):
-    """Emit: <tool_call>...</tool_call> for a tool call."""
-    lm += special_token("<tool_call>") + '\n'
-    lm += gjson(name=var_name, schema=TypeAdapter(FnArgs))
-    lm += special_token("</tool_call>")
-    return lm
+        call_models = []
+        for spec in self._by_name.values():
+            CallModel = create_model(
+                f"{spec.name}Call",
+                __base__=self._ForbidExtra,
+                # The discriminator; only this literal is allowed:
+                name=(Literal[spec.name], ...),
+                # Arguments must match this tool's Params exactly:
+                arguments=(spec.Params, ...),
+            )
+            call_models.append(CallModel)
+
+        # Discriminated union keyed by "name"
+        return TypeAdapter(Annotated[Union[tuple(call_models)], Field(discriminator="name")])
+
+    # Guidance template: now takes a schema argument
+    @guidance(stateless=True)
+    def tool_call(self, lm, var_name):
+        """Emit: <tool_call>...</tool_call> for a tool call."""
+        lm += special_token("<tool_call>") + "\n"
+        lm += gjson(name=var_name, schema=self._tool_call_union_type())
+        lm += special_token("</tool_call>")
+        return lm
+
+@contextmanager
+def thoughts(lm):
+    lm += special_token("<think>") + "\n"
+    yield lm
+    lm += special_token("</think>") + "\n\n"
+
+LINE_OR_BLANK = r"(?:- [^\n]{1,160}\n|\n)"
+
+def md_list(lm, name: str = "items"):
+    """
+    Emit a markdown bullet list.
+    The model must end the list by printing an empty line (just a newline).
+    Captures items (without the "- " and newline) into lm[var] as a list[str].
+
+    Tip: In your prompt, say something like:
+         "Produce N concise bullets and then end with a blank line."
+    """
+    items: list[str] = []
+    MAX_ITEMS = 64  # safety cap to avoid runaway generation
+
+    for i in range(MAX_ITEMS):
+        name_ = f"{name}_{i}"
+        lm += gen(name=name_, regex=LINE_OR_BLANK)
+
+        line = lm[name_]
+        if line == "\n":            # blank line => stop
+            break
+
+        # line is "- ...\n" per the regex; strip prefix and trailing newline
+        text = line.rstrip("\n")
+        if text.startswith(f"{i}. "):
+            text = text[2:]
+        items.append(text.strip())
+
+    return lm, items
 
 if __name__ == "__main__":
     lm = LlamaCpp(model="models/Qwen3-4B-Thinking-2507-F16.gguf", 
@@ -316,8 +388,8 @@ if __name__ == "__main__":
 
     tools = Tools()
     @tools.tool(description="Multiply two integers")
-    def multiply(a: int, b: int) -> int:
-        return a * b
+    def multiply(a1: int, a2: int) -> int:
+        return a1 * a2
 
     @tools.tool(description="Get current time for a timezone")
     def get_time(timezone: str) -> str:
@@ -333,9 +405,9 @@ if __name__ == "__main__":
 
     with assistant():
         lm += thoughts()
-        lm += select([gen(name="answer"), tool(var_name="tool_args")])
+        lm += tools.tool_call(var_name="tool_args")
         #lm += gen(name="answer")
     print(lm["thoughts"])
-    print(lm["answer"])
+    #print(lm["answer"])
     print(lm["tool_args"])
 

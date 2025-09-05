@@ -351,33 +351,49 @@ def thoughts(lm):
 
 LINE_OR_BLANK = r"(?:- [^\n]{1,160}\n|\n)"
 
-def md_list(lm, name: str = "items"):
-    """
-    Emit a markdown bullet list.
-    The model must end the list by printing an empty line (just a newline).
-    Captures items (without the "- " and newline) into lm[var] as a list[str].
 
-    Tip: In your prompt, say something like:
-         "Produce N concise bullets and then end with a blank line."
+def md_list(lm, style: str = "bullet") -> list[str]:
     """
+    Generate a markdown list directly into `lm`, stopping when the model emits a blank line.
+    Returns a Python list[str] of the captured items (without the prefix).
+
+    style: "bullet"  -> lines like "- item\n"
+           "numbered"-> lines like "1. item\n", "2. item\n", ...
+
+    Usage:
+        lm += "List 3–5 concise tips, then end with a blank line:\n"
+        tips = md_list(lm, style="bullet")
+    """
+    if style not in ("bullet", "numbered"):
+        raise ValueError("style must be 'bullet' or 'numbered'")
+
     items: list[str] = []
-    MAX_ITEMS = 64  # safety cap to avoid runaway generation
+    MAX_ITEMS = 64  
 
-    for i in range(MAX_ITEMS):
-        name_ = f"{name}_{i}"
-        lm += gen(name=name_, regex=LINE_OR_BLANK)
+    for i in range(1, MAX_ITEMS):
+        if style == "bullet":
+            pattern = r"(?:- [^\n]+\n|\n)"
+        else:
+            pattern = rf"(?:{i}\. [^\n]+\n|\n)"
 
-        line = lm[name_]
-        if line == "\n":            # blank line => stop
+        name = f"mdline{i}x"
+        lm += gen(name=name, regex=pattern, max_tokens=160)
+        line = lm[name]
+
+        if line == "\n":
             break
 
-        # line is "- ...\n" per the regex; strip prefix and trailing newline
-        text = line.rstrip("\n")
-        if text.startswith(f"{i}. "):
-            text = text[2:]
+        # Strip trailing newline and the visible prefix
+        line_no_nl = line[:-1]  # drop '\n'
+        if style == "bullet":
+            text = line_no_nl[2:] if line_no_nl.startswith("- ") else line_no_nl
+        else:
+            pref = f"{i+1}. "
+            text = line_no_nl[len(pref):] if line_no_nl.startswith(pref) else line_no_nl
+
         items.append(text.strip())
 
-    return lm, items
+    return items
 
 if __name__ == "__main__":
     lm = LlamaCpp(model="models/Qwen3-4B-Thinking-2507-F16.gguf", 

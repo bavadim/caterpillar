@@ -88,7 +88,12 @@ def map_sections(llm, section_name: str) -> Tuple[Metainfo, List[str]]:
 	return Metainfo(title=title, date=date, author=author), sections
 
 def parse_content_block(llm, section: str) -> str:
+	#TODO
 	return section
+
+def reduce_sections(sections: List[str]) -> str:
+	#TODO
+	return "\n\n".join(sections)
 
 def analyze_section(llm, section_name: str, level=0) -> str:
 	lm = llm
@@ -99,11 +104,12 @@ def analyze_section(llm, section_name: str, level=0) -> str:
 	], name=f"{section_name}_subs_choice")
 
 	if lm[f"{section_name}_subs_choice"] == "has Subsections:\n\n":
-		sections = md_list(lm, style="subsections")
+		_, sections = map_sections(lm, f"{section_name}")
+		subsections = []
 		for sub in sections:
-			meta, _sections = map_sections(llm, f"{section_name}/{sub}")
-			sections.extend(_sections)
-		content = reduce_sections(sections)
+			_content = analyze_section(llm, f"{section_name}/{sub}")
+			subsections.append(_content)
+		content = reduce_sections(subsections)
 	else:
 		content = parse_content_block(llm, section_name)
 

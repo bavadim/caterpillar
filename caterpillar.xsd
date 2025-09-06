@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="document-container">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="article"/>
+      </xs:sequence>
+      <xs:anyAttribute processContents="lax"/>
+    </xs:complexType>
+  </xs:element>
+
+  <xs:element name="article">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="h1" type="xs:string"/>
+        <xs:element name="author" type="xs:string" minOccurs="0"/>
+        <xs:element name="date" type="xs:string" minOccurs="0"/>
+        <xs:element name="nav" maxOccurs="1"/>
+        <xs:choice minOccurs="0" maxOccurs="unbounded">
+          <xs:element name="section" type="xs:anyType"/>
+          <xs:element name="aside" type="xs:anyType"/>
+        </xs:choice>
+      </xs:sequence>
+      <xs:anyAttribute processContents="lax"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

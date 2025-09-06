@@ -19,3 +19,7 @@ python parser.py path/to/document.pdf
 
 The script converts the PDF to HTML and streams the resulting XML to stdout.
 Sample files are available in `test_files/` for experimentation.
+
+## XML Schema
+
+The generated XML begins with an XML declaration and is wrapped in a `<document-container>` root element that references the `caterpillar.xsd` schema located in the project root. Use this schema to validate the structure of the output document.

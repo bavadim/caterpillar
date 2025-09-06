@@ -143,17 +143,22 @@ Example of the resulting XML:
 		lm += gen(name="think", max_tokens=1024)
 		lm += special_token("</think>")
 
-		lm += gen(name="result")
+		lm += gen(name="article")
 
-	print(lm)
-	return lm['result']
+	return (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+		"<document-container xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+		"xsi:noNamespaceSchemaLocation=\"caterpillar.xsd\">\n"
+		f"{lm['article']}\n"
+		"</document-container>"
+	)
 
 def html(path: str, mime: Optional[str]):
 	document = converter(path)
 	html, images = document.html, document.images
 
-	print(_parse_html(html))
+	return _parse_html(html)
 
 
 if __name__ == "__main__":
-	html(sys.argv[1], "application/pdf")
+	print(html(sys.argv[1], "application/pdf"))

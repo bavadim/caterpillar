@@ -24,6 +24,41 @@ converter = PdfConverter(
 	llm_service=cfg.get_llm_service()
 )
 
+def analize_section(lm, section_name: str, section_raw_html: str, level: int = 3, prefix: str = "sec") -> str:
+	"""Recursively analyze a section and return its XML content."""
+	lm += f"Exploring '{section_name}' section structure and potential subsections.\n\n"
+	lm += section_raw_html + "\n"
+	lm += select(["Subsections:\n\n", "No subsections.\n\n"], name=f"{prefix}_subs_choice")
+	subsections: list[str] = []
+	if lm[f"{prefix}_subs_choice"].startswith("Subsections"):
+		subsections = md_list(lm, style="numbered")
+		lm += "\n".join(subsections) + "\n\n"
+	indent = "\t" * (level - 1)
+	sub_indent = "\t" * level
+	result = ""
+	if subsections:
+		result += f"{indent}<nav>\n{sub_indent}<ul>\n"
+		for idx, sub in enumerate(subsections):
+			title = sub.split('. ')[1] if '. ' in sub else sub
+			anchor = f"{prefix}_{idx+1}"
+			result += f"{sub_indent}\t<li><a href=\"#{anchor}\">{title}</a></li>\n"
+		result += f"{sub_indent}</ul>\n{indent}</nav>\n"
+		for idx, sub in enumerate(subsections):
+			title = sub.split('. ')[1] if '. ' in sub else sub
+			anchor = f"{prefix}_{idx+1}"
+			lm += f"Raw HTML for subsection '{title}':\n<raw>\n"
+			lm += gen(name=f"{anchor}_raw", stop="</raw>")
+			lm += "</raw>\n"
+			raw_html = lm[f"{anchor}_raw"]
+			result += f"{indent}<section>\n{sub_indent}<h{level} id=\"{anchor}\">{title}</h{level}>\n"
+			result += analize_section(lm, title, raw_html, level + 1, anchor)
+			result += f"{indent}</section>\n"
+	else:
+		lm += "format_text:\n"
+		lm += gen(name=f"{prefix}_xml")
+		result += f"{indent}" + lm[f"{prefix}_xml"] + "\n"
+	return result
+
 def _parse_html(html: str):
 	lm = LlamaCpp(model="models/Qwen3-4B-Thinking-2507-F16.gguf", 
 			chat_template=Qwen3ChatTemplate,
@@ -110,35 +145,46 @@ Example of the resulting XML:
 		lm += html
 
 	with assistant():
-		lm += special_token("<think>") + '\n\n'
+		lm += special_token("<think>") + "\n\n"
 
-		lm += "Okay, I need to format this HTML into XML so that it looks like a book and is easy to read. "
-		lm += "To begin, I'll look at the original HTML and think about how to title the document and structure it.\n\n"
-		lm += "First, I'll think about how to split the document into chapters. The document includes the following chapters:\n\n"
+		lm += "Exploring the document structure, extracting metadata, and formatting each part recursively.\n\n"
+		lm += "Top-level sections to build the document <nav>:\n\n"
 		sections = md_list(lm, style="numbered")
-		lm += '\n'.join(sections) + '\n\n'
+		lm += "\n".join(sections) + "\n\n"
 
-		lm += "Now, based on the document and the table of contents, I'll come up with a title for the document. "
-		lm += "Based on the table of contents, the following title can be proposed for the entire document: <h1>"
+		lm += "Extract or invent the title, date, and author for the document.\n"
+		lm += "Title: <h1>"
 		lm += gen(name="title", stop="</h1>")
-		lm += "</h1>. "
+		lm += "</h1>\n"
 		title = lm["title"]
+		lm += "Date: <date>"
+		lm += gen(name="date", stop="</date>")
+		lm += "</date>\n"
+		date = lm["date"]
+		lm += "Author: <author>"
+		lm += gen(name="author", stop="</author>")
+		lm += "</author>\n\n"
+		author = lm["author"]
 
-		lm += "Now I can create a skeleton of the XML document that includes the title, the table of contents, and placeholders for the chapters:\n\n"
-		lm += f"<article>\n\t<h1>{title}</h1>\n\t<nav>\n\t\t<h2>Table of Contents</h2>\n\t\t<ul>\n"
+		lm += "I'll use the metadata to frame an XML skeleton with <title>, <author>, <date>, and a <nav> listing each section. For every section, I'll keep its raw HTML inside a <section_html> tag for recursive analysis later.\n\n"
+		lm += f"<article>\n\t<h1>{title}</h1>\n\t<author>{author}</author>\n\t<date>{date}</date>\n\t<nav>\n\t\t<h2>Table of Contents</h2>\n\t\t<ul>\n"
 		for i, section in enumerate(sections):
-			lm += f"			<li><a href=\"#section_{i+1}\">{section.split('. ')[1]}</a></li>\n"
-		lm += "		</ul>\n	</nav>\n\n"
+			lm += f"\t\t\t<li><a href=\"#section_{i+1}\">{section.split('. ')[1]}</a></li>\n"
+		lm += "\t\t</ul>\n\t</nav>\n\n"
 
 		for i, section in enumerate(sections):
-			lm += "	<section>\n"
-			lm += f"		<h2 id=\"section_{i+1}\">{section.split('. ')[1]}</h2>\n"
-			lm += f'		<!-- chapter content "{section}" -->\n'
-			lm += "	</section>\n\n"
+			name = section.split('. ')[1]
+			lm += "\t<section>\n"
+			lm += f"\t\t<h2 id=\"section_{i+1}\">{name}</h2>\n"
+			lm += "\t\t<!-- Here I should process the following raw section html: <section_html> -->\n"
+			lm += "\t\t<section_html>\n"
+			lm += gen(name=f"section_{i+1}_raw", stop="</section_html>")
+			lm += "\t\t</section_html>\n"
+			section_raw = lm[f"section_{i+1}_raw"]
+			lm += analize_section(lm, name, section_raw, 3, f"section_{i+1}")
+			lm += "\t</section>\n\n"
 
 		lm += "</article>\n\n"
-
-		lm += "Now I have the overall structure of the XML response. Next, I will fill in the content of each chapter, fix typos and formatting, and add any missing elements.\n\n"
 
 		lm += gen(name="think", max_tokens=1024)
 		lm += special_token("</think>")

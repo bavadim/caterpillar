@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 
+from dataclasses import dataclass
 import sys
-from typing import Optional
+from turtle import title
+from typing import Dict, List, Optional, Tuple, Union
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.config.parser import ConfigParser
@@ -10,6 +12,43 @@ from guidance.models import LlamaCpp
 from guidance import system, user, assistant, gen,  special_token, select
 
 from chat_template import Qwen3ChatTemplate, md_list, thoughts
+
+
+@dataclass
+class Metainfo:
+	title: str
+	date: str
+	author: str
+
+@dataclass
+class Paragraph:
+	content: str
+
+@dataclass
+class Table:
+	headers: List[str]
+	rows: List[Dict[str, str]]
+
+@dataclass
+class ImgRef:
+	target: str
+	name: str
+
+@dataclass
+class Ref:
+	target: str
+	name: str
+
+@dataclass
+class Nav:
+	items: List[Ref]
+
+@dataclass
+class Article:
+	nav: Optional[Nav]
+	metainfo: Metainfo
+	content: List[Union[Paragraph, Table, ImgRef]]
+
 
 converter = PdfConverter(
 	artifact_dict=create_model_dict(),
@@ -24,40 +63,51 @@ converter = PdfConverter(
 	llm_service=cfg.get_llm_service()
 )
 
-def analize_section(lm, section_name: str, section_raw_html: str, level: int = 3, prefix: str = "sec") -> str:
-	"""Recursively analyze a section and return its XML content."""
-	lm += f"Exploring '{section_name}' section structure and potential subsections.\n\n"
-	lm += section_raw_html + "\n"
-	lm += select(["Subsections:\n\n", "No subsections.\n\n"], name=f"{prefix}_subs_choice")
-	subsections: list[str] = []
-	if lm[f"{prefix}_subs_choice"].startswith("Subsections"):
-		subsections = md_list(lm, style="numbered")
-		lm += "\n".join(subsections) + "\n\n"
-	indent = "\t" * (level - 1)
-	sub_indent = "\t" * level
-	result = ""
-	if subsections:
-		result += f"{indent}<nav>\n{sub_indent}<ul>\n"
-		for idx, sub in enumerate(subsections):
-			title = sub.split('. ')[1] if '. ' in sub else sub
-			anchor = f"{prefix}_{idx+1}"
-			result += f"{sub_indent}\t<li><a href=\"#{anchor}\">{title}</a></li>\n"
-		result += f"{sub_indent}</ul>\n{indent}</nav>\n"
-		for idx, sub in enumerate(subsections):
-			title = sub.split('. ')[1] if '. ' in sub else sub
-			anchor = f"{prefix}_{idx+1}"
-			lm += f"Raw HTML for subsection '{title}':\n<raw>\n"
-			lm += gen(name=f"{anchor}_raw", stop="</raw>")
-			lm += "</raw>\n"
-			raw_html = lm[f"{anchor}_raw"]
-			result += f"{indent}<section>\n{sub_indent}<h{level} id=\"{anchor}\">{title}</h{level}>\n"
-			result += analize_section(lm, title, raw_html, level + 1, anchor)
-			result += f"{indent}</section>\n"
+def map_sections(llm, section_name: str) -> Tuple[Metainfo, List[str]]:
+	lm = llm
+
+	lm += f"Now, I will extract chapters/subsections of the {section_name}. "
+	lm += "I pay attention to the size of extracted content and make separate section for each sensitive block:\n\n"
+	sections = md_list(lm, style="numbered")
+	lm += "\n".join(sections) + "\n\n"
+
+	lm += f"Now, I'll extract the title, date, and author for the {section_name}.\n"
+	lm += "Title: <title>"
+	lm += gen(name="title", stop="</title>")
+	lm += "</title>\n"
+	title = lm["title"]
+	lm += "Date: <date>"
+	lm += gen(name="date", stop="</date>")
+	lm += "</date>\n"
+	date = lm["date"]
+	lm += "Author: <author>"
+	lm += gen(name="author", stop="</author>")
+	lm += "</author>\n\n"
+	author = lm["author"]
+
+	return Metainfo(title=title, date=date, author=author), sections
+
+def parse_content_block(llm, section: str) -> str:
+	return section
+
+def analyze_section(llm, section_name: str, level=0) -> str:
+	lm = llm
+	lm += f"Now, I'll explore '{section_name}' structure and determinate potential sections. "
+	lm += f"I see '{section_name}' " + select([
+		"has Subsections:\n\n",
+		"has No subsections.\n\n"
+	], name=f"{section_name}_subs_choice")
+
+	if lm[f"{section_name}_subs_choice"] == "has Subsections:\n\n":
+		sections = md_list(lm, style="subsections")
+		for sub in sections:
+			meta, _sections = map_sections(llm, f"{section_name}/{sub}")
+			sections.extend(_sections)
+		content = reduce_sections(sections)
 	else:
-		lm += "format_text:\n"
-		lm += gen(name=f"{prefix}_xml")
-		result += f"{indent}" + lm[f"{prefix}_xml"] + "\n"
-	return result
+		content = parse_content_block(llm, section_name)
+
+	return content
 
 def _parse_html(html: str):
 	lm = LlamaCpp(model="models/Qwen3-4B-Thinking-2507-F16.gguf", 
@@ -100,7 +150,7 @@ The resulting XML must use the following tags:
 * Links must use `<a>` tags.
 * Tables must use `<table>`, `<tr>`, `<th>`, `<td>`, `<caption>`, `<thead>`, `<tbody>`.
 * Images must use `<img>`.
-* Use `<date>` and `<author>` tags for document metadata.
+* Use `<date>`, `<title>` and `<author>` tags for document metadata.
 
 Example of the resulting XML:
 
@@ -147,25 +197,10 @@ Example of the resulting XML:
 	with assistant():
 		lm += special_token("<think>") + "\n\n"
 
-		lm += "Exploring the document structure, extracting metadata, and formatting each part recursively.\n\n"
-		lm += "Top-level sections to build the document <nav>:\n\n"
-		sections = md_list(lm, style="numbered")
-		lm += "\n".join(sections) + "\n\n"
-
-		lm += "Extract or invent the title, date, and author for the document.\n"
-		lm += "Title: <h1>"
-		lm += gen(name="title", stop="</h1>")
-		lm += "</h1>\n"
-		title = lm["title"]
-		lm += "Date: <date>"
-		lm += gen(name="date", stop="</date>")
-		lm += "</date>\n"
-		date = lm["date"]
-		lm += "Author: <author>"
-		lm += gen(name="author", stop="</author>")
-		lm += "</author>\n\n"
-		author = lm["author"]
-
+		lm += "First, I'll explore the document structure, extract metadata, and formatting each chapter.\n\n"
+		title, date, author, sections = extract_metainfo(lm, "document")
+		lm += f'I see document has the following props: Title: "{title}"; Date: "{date}"; Author: "{author}"; Sections:\n{"\n\t".join(sections)}\n'
+		
 		lm += "I'll use the metadata to frame an XML skeleton with <title>, <author>, <date>, and a <nav> listing each section. For every section, I'll keep its raw HTML inside a <section_html> tag for recursive analysis later.\n\n"
 		lm += f"<article>\n\t<h1>{title}</h1>\n\t<author>{author}</author>\n\t<date>{date}</date>\n\t<nav>\n\t\t<h2>Table of Contents</h2>\n\t\t<ul>\n"
 		for i, section in enumerate(sections):
@@ -181,7 +216,7 @@ Example of the resulting XML:
 			lm += gen(name=f"section_{i+1}_raw", stop="</section_html>")
 			lm += "\t\t</section_html>\n"
 			section_raw = lm[f"section_{i+1}_raw"]
-			lm += analize_section(lm, name, section_raw, 3, f"section_{i+1}")
+			lm += analyze_section(lm, name, section_raw, 3, f"section_{i+1}")
 			lm += "\t</section>\n\n"
 
 		lm += "</article>\n\n"
